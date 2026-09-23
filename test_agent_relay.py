@@ -22,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
+from database import Agent, Attempt, Base, Task, as_db_time, db_session, engine, utcnow
 from storage import claim_one
 
 
@@ -160,3 +160,79 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         missing_name = client.post("/api/v1/agents", json={})
         assert missing_name.status_code == 400
         assert missing_name.json()["error"]["code"] == "invalid_input"
+
+
+def test_two_agents_exchange_task_and_result_end_to_end():
+    """SPEC acceptance scenario 1, checked through the API and in the database."""
+    with TestClient(main.app) as client:
+        sender, sender_headers = register(client, "alice-sender")
+        recipient, recipient_headers = register(client, "bob-reviewer")
+        assert sender["agent_id"] != recipient["agent_id"]
+
+        sent = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "Review: def f(n): return range(n+1)"},
+        )
+        assert sent.status_code == 201
+        assert sent.json()["status"] == "queued"
+        task_id = sent.json()["task_id"]
+
+        # Only the addressed agent's inbox receives it.
+        assert client.post(
+            "/api/v1/tasks/claim", headers=sender_headers, json={"wait_seconds": 0}
+        ).status_code == 204
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=recipient_headers,
+            json={"worker_id": "bob-1", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claimed = claim.json()
+        assert claimed["task_id"] == task_id
+        assert claimed["from"] == sender["agent_id"]
+        assert claimed["attempt"] == 1
+
+        pending = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert pending["status"] == "processing"
+        assert pending["output"] is None
+
+        output = "Off-by-one: range(n+1) yields n+1 items."
+        done = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=recipient_headers,
+            json={"claim_token": claimed["claim_token"], "output": output},
+        )
+        assert done.status_code == 200
+        assert done.json() == {"task_id": task_id, "status": "completed"}
+
+        # Both parties read the result; the sender sees it as a sent task.
+        for headers in (sender_headers, recipient_headers):
+            task = client.get(f"/api/v1/tasks/{task_id}", headers=headers).json()
+            assert task["status"] == "completed"
+            assert task["output"] == output
+            assert task["error"] is None
+            assert task["from"] == sender["agent_id"]
+            assert task["to"] == recipient["agent_id"]
+            assert task["attempt_count"] == 1
+            assert task["finished_at"] is not None
+        sent_list = client.get("/api/v1/tasks?direction=sent", headers=sender_headers).json()
+        assert [t["task_id"] for t in sent_list["items"]] == [task_id]
+
+        attempts = client.get(f"/api/v1/tasks/{task_id}/attempts", headers=sender_headers).json()["items"]
+        assert len(attempts) == 1
+        assert attempts[0]["worker_id"] == "bob-1"
+        assert attempts[0]["outcome"] == "completed"
+        assert "claim_token" not in attempts[0]
+
+    # What actually landed in SQLite: tokens are stored only as hashes.
+    with db_session() as db:
+        row = db.get(Task, task_id)
+        assert (row.status, row.output, row.attempt_count) == ("completed", output, 1)
+        assert row.sender_id == sender["agent_id"] and row.recipient_id == recipient["agent_id"]
+        attempt = db.query(Attempt).filter_by(task_id=task_id).one()
+        assert attempt.outcome == "completed"
+        assert attempt.claim_token_hash != claimed["claim_token"]
+        stored = {a.token_hash for a in db.query(Agent).all()}
+        assert sender["token"] not in stored and recipient["token"] not in stored
