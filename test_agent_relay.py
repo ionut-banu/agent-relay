@@ -18,6 +18,7 @@ os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db"
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -162,9 +163,16 @@ def test_dashboard_is_asset_and_invalid_input_is_documented_error():
         assert missing_name.json()["error"]["code"] == "invalid_input"
 
 
+# Set to a running API (e.g. the Compose stack) to run the end-to-end test over
+# HTTP instead of in-process. Nothing is reset in that mode, so its agents and
+# task stay visible in the dashboard; the direct-database checks are skipped.
+LIVE_URL = os.getenv("RELAY_TEST_BASE_URL")
+
+
 def test_two_agents_exchange_task_and_result_end_to_end():
     """SPEC acceptance scenario 1, checked through the API and in the database."""
-    with TestClient(main.app) as client:
+    client_cm = httpx.Client(base_url=LIVE_URL, timeout=15) if LIVE_URL else TestClient(main.app)
+    with client_cm as client:
         sender, sender_headers = register(client, "alice-sender")
         recipient, recipient_headers = register(client, "bob-reviewer")
         assert sender["agent_id"] != recipient["agent_id"]
@@ -225,6 +233,12 @@ def test_two_agents_exchange_task_and_result_end_to_end():
         assert attempts[0]["worker_id"] == "bob-1"
         assert attempts[0]["outcome"] == "completed"
         assert "claim_token" not in attempts[0]
+
+        if LIVE_URL:
+            print(f"\nLIVE task {task_id}\nsender token    {sender['token']}\nrecipient token {recipient['token']}")
+
+    if LIVE_URL:
+        return
 
     # What actually landed in SQLite: tokens are stored only as hashes.
     with db_session() as db:

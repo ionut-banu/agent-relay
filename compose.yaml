@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+      POSTGRES_DB: relay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  agent-relay:
+    build: .
+    image: agent-relay:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:${POSTGRES_PASSWORD:-relay}@postgres:5432/relay
+    ports:
+      # Override with RELAY_PORT=8080 if 8000 is taken on your machine.
+      - "${RELAY_PORT:-8000}:8000"
+
+volumes:
+  pgdata:

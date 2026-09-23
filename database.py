@@ -1,9 +1,11 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+PostgreSQL is the deployed database (see ``compose.yaml``); SQLite remains the
+zero-setup default for local runs and the test suite.  This module is the only
+place that knows about SQLite connection pragmas.  Serialization differs by
+dialect: SQLite takes its single writer lock up front, PostgreSQL takes row
+locks (``FOR UPDATE`` / ``SKIP LOCKED``) inside :mod:`storage`, always in the
+order task row, then attempt rows, so concurrent transactions cannot deadlock.
 """
 
 from __future__ import annotations
@@ -19,7 +21,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    url = os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    # Bare postgres:// and postgresql:// would select psycopg2, which is not installed.
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    return url
 
 
 def positive_int(name: str, default: int) -> int:
@@ -177,19 +184,19 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one atomic transaction for claims, heartbeats, terminal results and recovery.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite has no row locks, so ``BEGIN IMMEDIATE`` reserves the single writer
+    slot and serializes these operations across API processes.  On PostgreSQL
+    the transaction starts normally and callers take row locks (``FOR UPDATE``,
+    ``SKIP LOCKED``), which lets unrelated tasks proceed in parallel.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -205,17 +212,20 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
-    )
+    # Find candidates without locks, then lock each task row before touching
+    # its attempt.  Every writer locks task-then-attempt, in the same order.
+    candidates = db.execute(
+        select(Attempt.id, Attempt.task_id)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
+    ).all()
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for attempt_id, task_id in candidates:
+        task = db.get(Task, task_id, with_for_update=True, populate_existing=True)
+        attempt = db.get(Attempt, attempt_id, populate_existing=True)
+        if task is None or attempt is None or attempt.outcome != "processing":
+            continue  # another process recovered or finished it first
+        if db_time(attempt.lease_expires_at) > db_time(now_db):
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
