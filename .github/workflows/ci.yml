@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and integration test (PostgreSQL)
+    runs-on: ubuntu-latest
+    # Running the job in a container makes the service reachable as "postgres"
+    # both on GitHub and under `act`, and needs no published host port. The
+    # image ships Node (which `act` needs for JS actions); uv provides Python.
+    container: node:22-bookworm
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # The suite drops and recreates every table, so it gets its own database.
+      - name: Create scratch database for the test suite
+        run: |
+          uv run --frozen python - <<'PY'
+          import psycopg
+          with psycopg.connect("postgresql://relay:relay@postgres:5432/relay", autocommit=True) as c:
+              c.execute("CREATE DATABASE relay_test")
+          PY
+
+      - name: Run tests against PostgreSQL
+        env:
+          RELAY_DATABASE_URL: postgresql://relay:relay@postgres:5432/relay_test
+        run: uv run --frozen pytest -q
+
+      # Real server + real PostgreSQL, driven over HTTP by the end-to-end test.
+      - name: Start the API against PostgreSQL
+        run: |
+          RELAY_DATABASE_URL=postgresql://relay:relay@postgres:5432/relay \
+            uv run --frozen uvicorn main:app --port 8000 > uvicorn.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:8000/ready && exit 0
+            sleep 1
+          done
+          cat uvicorn.log
+          exit 1
+
+      - name: Run integration test over HTTP
+        env:
+          RELAY_TEST_BASE_URL: http://localhost:8000
+        run: uv run --frozen pytest -q -k end_to_end
+
+      - name: Confirm the result was stored in PostgreSQL
+        run: |
+          uv run --frozen python - <<'PY'
+          import psycopg
+          with psycopg.connect("postgresql://relay:relay@postgres:5432/relay") as c:
+              n = c.execute(
+                  "SELECT count(*) FROM tasks WHERE status = 'completed' AND output IS NOT NULL"
+              ).fetchone()[0]
+          print("completed tasks in postgres:", n)
+          assert n >= 1
+          PY
+
+      - name: API log
+        if: failure()
+        run: cat uvicorn.log
+
+  deploy:
+    name: Build image and deploy to kind
+    needs: test
+    # Never deploy from a pull request.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      # A new tag per version, so applying the manifest always rolls out the new
+      # image. Local `act` runs add a timestamp: the commit SHA does not change
+      # when you edit files without committing.
+      - name: Choose a unique image tag
+        run: |
+          tag="${GITHUB_SHA::12}"
+          if [ -n "${ACT:-}" ]; then tag="${tag}-local$(date +%s)"; fi
+          echo "IMAGE=agent-relay:${tag}" >> "$GITHUB_ENV"
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE" .
+
+      # On GitHub: create a throwaway cluster. Under act this action must NOT run:
+      # its post-step always deletes the cluster named in `cluster_name`, which
+      # here is your real local cluster.
+      - name: Create kind cluster
+        if: ${{ !env.ACT }}
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: agent-relay
+
+      # Under act: install the CLIs (kind matches the version that built the
+      # local cluster; an older kind cannot load images into newer nodes) and
+      # reuse the cluster from `kind create cluster --name agent-relay`.
+      - name: Install kind and kubectl (local act run)
+        if: ${{ env.ACT }}
+        run: |
+          arch=$(dpkg --print-architecture)
+          curl -fsSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-${arch}"
+          curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.35.2/bin/linux/${arch}/kubectl"
+          chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+          kind version
+
+      # act starts this job on the `kind` docker network (see .actrc), so use the
+      # kubeconfig that addresses the node by its in-network name.
+      - name: Connect to the local kind cluster
+        if: ${{ env.ACT }}
+        run: |
+          kind get clusters | grep -qx agent-relay || { echo "kind cluster 'agent-relay' not found"; exit 1; }
+          mkdir -p ~/.kube
+          kind get kubeconfig --name agent-relay --internal > ~/.kube/config
+
+      - name: Load image into kind
+        run: kind load docker-image "$IMAGE" --name agent-relay
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/postgres.yaml
+          sed "s|image: agent-relay:local|image: $IMAGE|" k8s/agent-relay.yaml | kubectl apply -f -
+          kubectl rollout status statefulset/postgres --timeout=180s
+          kubectl rollout status deployment/agent-relay --timeout=180s
+
+      - name: Verify the new image is the one running
+        run: |
+          running=$(kubectl get deployment agent-relay -o jsonpath='{.spec.template.spec.containers[0].image}')
+          echo "deployed: $running"
+          [ "$running" = "$IMAGE" ]
+          kubectl get pods -l app=agent-relay
+
+      - name: Smoke test the deployment
+        run: |
+          kubectl port-forward svc/agent-relay 8080:8000 &
+          for _ in $(seq 1 15); do curl -sf http://localhost:8080/ready && break; sleep 1; done
+          uv sync --frozen
+          RELAY_TEST_BASE_URL=http://localhost:8080 uv run --frozen pytest -q -k end_to_end
+
+      - name: Cluster state
+        if: always()
+        run: |
+          kubectl get pods,svc,pvc
+          kubectl describe pods | tail -60

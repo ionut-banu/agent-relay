@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  labels: {app: agent-relay}
+spec:
+  selector: {app: agent-relay}
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  labels: {app: agent-relay}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: agent-relay}
+  template:
+    metadata:
+      labels: {app: agent-relay}
+    spec:
+      initContainers:
+        # The app creates its tables at import time, so wait for the database.
+        - name: wait-for-postgres
+          image: postgres:16
+          command: ["sh", "-c", "until pg_isready -h postgres -p 5432; do sleep 2; done"]
+      containers:
+        - name: agent-relay
+          image: agent-relay:local
+          imagePullPolicy: IfNotPresent   # loaded with `kind load docker-image`
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: postgres-credentials, key: POSTGRES_PASSWORD}
+            - name: RELAY_DATABASE_URL
+              value: postgresql+psycopg://relay:$(POSTGRES_PASSWORD)@postgres:5432/relay
+          readinessProbe:
+            httpGet: {path: /ready, port: http}   # also verifies the DB tables exist
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
